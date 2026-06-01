@@ -3,18 +3,19 @@ import os
 import subprocess
 import json
 import ctypes
+import tempfile
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog
 
-CONFIG_PATH = Path.home() / ".fbx2blender_bridge_config.json"
+CONFIG_PATH = Path.home() / ".double_click_fbx_viewer.json"
 
 
-def show_error(message, title="FBX 2 Blender Bridge"):
+def show_error(message, title="Double-Click FBX Viewer"):
     ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 | 0x0)
 
 
-def show_info(message, title="FBX 2 Blender Bridge"):
+def show_info(message, title="Double-Click FBX Viewer"):
     ctypes.windll.user32.MessageBoxW(0, message, title, 0x40 | 0x0)
 
 
@@ -52,10 +53,14 @@ def find_blender():
         path = Path(config["blender_path"])
         if path.exists():
             return str(path)
+
     env_path = os.environ.get("BLENDER_EXECUTABLE")
     if env_path and Path(env_path).exists():
-        save_config({"blender_path": env_path})
+        cfg = load_config()
+        cfg["blender_path"] = env_path
+        save_config(cfg)
         return env_path
+
     try:
         import winreg
 
@@ -72,34 +77,17 @@ def find_blender():
             pass
     except ImportError:
         pass
+
     pf = os.environ.get("ProgramFiles", "C:\\Program Files")
     pf86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
     for base in [pf, pf86]:
-        for ver in [
-            "5.0",
-            "4.5",
-            "4.4",
-            "4.3",
-            "4.2",
-            "4.1",
-            "4.0",
-            "3.6",
-            "3.5",
-            "3.4",
-            "3.3",
-            "3.2",
-            "3.1",
-            "3.0",
-            "",
-        ]:
-            path = (
-                Path(base)
-                / "Blender Foundation"
-                / (f"Blender {ver}" if ver else "Blender")
-                / "blender.exe"
-            )
-            if path.exists():
-                return str(path)
+        bf_dir = Path(base) / "Blender Foundation"
+        if not bf_dir.is_dir():
+            continue
+        candidates = sorted(bf_dir.glob("*/blender.exe"), reverse=True)
+        if candidates:
+            return str(candidates[0])
+
     return None
 
 
@@ -125,58 +113,72 @@ def launch_blender_with_fbx(fbx_path):
                 "Setup Failed",
             )
             sys.exit(1)
+
     script = f"""
 import bpy
 import sys
 fbx_path = {json.dumps(fbx_path)}
 try:
-    bpy.ops.import_scene.fbx(filepath=fbx_path)
+    if bpy.app.version >= (5, 0, 0):
+        bpy.ops.wm.fbx_import(filepath=fbx_path)
+    else:
+        bpy.ops.import_scene.fbx(filepath=fbx_path)
 except Exception as e:
     print(f"Import failed: {{e}}", file=sys.stderr)
     bpy.ops.wm.quit_blender()
     sys.exit(1)
 for area in bpy.context.screen.areas:
     if area.type == 'VIEW_3D':
-        override = {{'area': area, 'region': area.regions[0]}}
-        with bpy.context.temp_override(**override):
-            bpy.ops.view3d.view_all(center=True)
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if region:
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.view3d.view_all(center=True)
         break
 """
-    import tempfile
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, encoding="utf-8"
     ) as tmp:
         tmp.write(script)
         script_path = tmp.name
+
     try:
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        subprocess.Popen(
+        subprocess.run(
             [blender_path, "--python", script_path],
             startupinfo=startupinfo,
-            close_fds=True,
         )
     except (subprocess.SubprocessError, OSError) as e:
         show_error(
             f"Failed to launch Blender:\n{e}\n\nPath: {blender_path}", "Launch Error"
         )
         sys.exit(1)
+    finally:
+        if os.path.exists(script_path):
+            os.unlink(script_path)
 
 
 def main():
+    if sys.platform != "win32":
+        print("Error: This script is Windows-only.", file=sys.stderr)
+        sys.exit(1)
+
     if len(sys.argv) < 2:
         show_error(
             "No FBX file specified. Please double-click an .fbx file.", "Usage Error"
         )
         sys.exit(1)
+
     fbx_path = os.path.abspath(sys.argv[1])
     if not os.path.exists(fbx_path):
         show_error(f"File not found:\n{fbx_path}", "File Error")
         sys.exit(1)
+
     if not fbx_path.lower().endswith(".fbx"):
         show_error(f"Not an FBX file:\n{fbx_path}", "File Type Error")
         sys.exit(1)
+
     launch_blender_with_fbx(fbx_path)
 
 
